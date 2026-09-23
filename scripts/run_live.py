@@ -49,6 +49,7 @@ from scanner.data import FEEDS, make_feed
 from scanner.live_scanner import LiveScanner
 from scanner.market import classify_market
 from scanner.custom_setups import CustomEvaluator
+from scanner import __version__
 from scanner.fundamentals import get_cache as get_fundamentals_cache
 from scanner.profiles import ProfileEngine
 from scanner.events import EventBuffer, make_hodlod_hook   # Dashboard V2 HOD/LOD ticker
@@ -366,7 +367,7 @@ def main() -> None:
     data_desc = args.feed.capitalize()
     if args.feed == "alpaca":
         data_desc += f" ({(os.environ.get('ALPACA_FEED') or 'sip').strip().upper()} feed)"
-    _banner(f"Live Scanner  -- {date.today()}   data: {data_desc}")
+    _banner(f"Edge Scanner v{__version__}  -- {date.today()}   data: {data_desc}")
     TOTAL_STEPS = 6
 
     # ── 1. Universe ───────────────────────────────────────────────────────────
@@ -503,7 +504,7 @@ def main() -> None:
                 continue
             state._reset_intraday()  # clear any partial state from warmup
             for ts, row in sym_bars.iterrows():
-                state.on_bar({
+                _bar = {
                     "symbol":    sym,
                     "timestamp": ts,
                     "open":      float(row["open"]),
@@ -511,7 +512,14 @@ def main() -> None:
                     "low":       float(row["low"]),
                     "close":     float(row["close"]),
                     "volume":    float(row["volume"]),
-                }, spy_bar_map.get(ts))
+                }
+                state.on_bar(_bar, spy_bar_map.get(ts))
+                # The candle rings too, in the same order as live. They hold the
+                # day's high and low, the opening-range candle and today's candles
+                # for every composed trigger. Left empty, a start after the open
+                # made each new local high a "new high of day" for the rest of the
+                # session and left the opening range undefined.
+                scanner._advance_series(state, _bar)
             seeded_from_bars.add(sym)
         print(
             f"       {len(seeded_from_bars)}/{len(all_syms)} symbols seeded from bars"
@@ -520,6 +528,42 @@ def main() -> None:
         )
     except Exception as exc:
         print(f"       WARNING: Could not seed intraday bars: {exc}", flush=True)
+
+    # A provider that can back-fill today's bars only for its most liquid symbols
+    # (Schwab) fills the rest from quotes when the session is already under way:
+    # one catch-up bar holding the day's open, high, low, last and volume so far.
+    # It goes straight into the symbol's state, like the bars above, so it never
+    # reaches a setup and cannot fire an alert.
+    try:
+        _now_et = pd.Timestamp.now(tz="America/New_York")
+        _rth = _now_et.weekday() < 5 and (9 * 60 + 31) <= (_now_et.hour * 60 + _now_et.minute) < 16 * 60
+        if _rth and hasattr(feed, "get_session_quotes"):
+            todo = [s for s in scanner.ranked_symbols() if s not in seeded_from_bars]
+            quotes = feed.get_session_quotes(todo) if todo else {}
+            stamp = (_now_et.floor("min") - pd.Timedelta(minutes=1)).tz_convert("UTC")
+            for sym, q in quotes.items():
+                state = scanner._states.get(sym)
+                if state is None:
+                    continue
+                state._reset_intraday()
+                # On the same footing as the bars this provider builds from quotes.
+                _bar = {"symbol": sym, "timestamp": stamp, "open": q["open"], "high": q["high"],
+                        "low": q["low"], "close": q["last"],
+                        "volume": q["volume"] * float(getattr(feed, "BAR_VOLUME_SHARE", 1.0))}
+                state.on_bar(_bar)
+                # The candle rings get the day's high and low only, never this bar:
+                # it holds the whole session's volume, and as a candle it read as a
+                # 10x to 25x volume spike the moment its 5-minute candle closed
+                # (measured: 44 false Volume Spike alerts after one mid-session start).
+                _ser = scanner.series(sym)
+                _ser.session_date = _now_et.strftime("%Y-%m-%d")
+                _ser.day_high, _ser.day_low = q["high"], q["low"]
+                _ser.ext_high, _ser.ext_low = q["high"], q["low"]
+            if todo:
+                print(f"       {len(quotes)}/{len(todo)} more symbols caught up from quotes (volume and "
+                      f"high/low so far; VWAP approximate until the next start before the open)", flush=True)
+    except Exception as exc:
+        print(f"       WARNING: Could not catch up from quotes: {exc}", flush=True)
 
     # (The old snapshot daily_volume fallback for symbols with no bars today was
     # removed: that figure includes premarket volume, which the RTH-only volume
@@ -533,6 +577,8 @@ def main() -> None:
         start_background_prefetch(list(scanner._states.keys()))
         print("       Dashboard V2: fundamentals prefetch running in background (--no-fundamentals to skip)", flush=True)
     _api_app = create_app(app_state)
+    from scanner.update_check import start_background_check
+    start_background_check()          # one anonymous GET to GitHub; UPDATE_CHECK=0 turns it off
     print(f"       Dashboard V2: http://localhost:{args.port}/v2  (build: npm --prefix dashboard-v2 run build)", flush=True)
     _server_cfg = uvicorn.Config(_api_app, host=args.host, port=args.port, log_level="warning")
     _api_server = uvicorn.Server(_server_cfg)
@@ -563,6 +609,15 @@ def main() -> None:
     scanner.attach_custom(custom_eval, custom_sink)
     custom_eval.warmup(symbol_daily, bars_5m)
     app_state.custom_eval = custom_eval
+    # Today's bars were replayed into the candle rings above, not through the
+    # triggers. Record where every trigger stands now, so a start after the open
+    # does not alert on the morning's gap, RVOL cross or streak as if new.
+    _spy = scanner._spy_state
+    _primed = custom_eval.prime(scanner._states,
+                                spy_mom_15m=_spy.mom_15m_pct if _spy is not None else None)
+    if _primed:
+        print(f"       Custom setups: {_primed} symbols primed from today's bars "
+              "(events before the start do not alert)", flush=True)
 
     # Universe profiles: the screen each setup is checked against before an
     # alert is emitted. Everything defaults to the empty "up_all" profile, so

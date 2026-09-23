@@ -139,3 +139,27 @@ def test_prior_date_bar_is_dropped_before_any_mutation():
     sc._on_bar(_bar("2026-09-21 15:59", 10.0, "SPY"))         # late, from yesterday
     sc._on_bar(_bar("2026-09-22 09:31", 401.0, "SPY"))
     assert [b["close"] for b in seen] == [400.0, 401.0]
+
+
+# ── premarket lists on a provider with no batch history (Schwab) ─────────────
+
+def test_premarket_lists_come_from_live_state_with_no_requests():
+    from types import SimpleNamespace
+    from fastapi.testclient import TestClient
+    from scanner.api import AppState, create_app
+
+    calls = []
+    feed = SimpleNamespace(per_symbol_history=True,
+                           get_todays_bars_multi=lambda *a, **k: calls.append(1) or {})
+    states = {
+        "UP": SimpleNamespace(prior_close=10.0, pm_last=11.0, pm_vol=5_000.0),
+        "DOWN": SimpleNamespace(prior_close=20.0, pm_last=19.0, pm_vol=9_000.0),
+        "QUIET": SimpleNamespace(prior_close=5.0, pm_last=None, pm_vol=0.0),
+    }
+    app_state = AppState(scanner=SimpleNamespace(_states=states, _profiles=None), feed=feed)
+    r = TestClient(create_app(app_state)).get("/api/premarket").json()
+    assert calls == []                                            # nothing was downloaded
+    assert [x["symbol"] for x in r["gainers"]] == ["UP"] and r["gainers"][0]["change_pct"] == 10.0
+    assert [x["symbol"] for x in r["losers"]] == ["DOWN"]
+    assert [x["symbol"] for x in r["volume"]] == ["DOWN", "UP"]
+    assert r["symbols_active"] == 2 and r["symbols_total"] == 3

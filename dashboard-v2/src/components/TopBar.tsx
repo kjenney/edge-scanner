@@ -30,6 +30,33 @@ function FeedDots() {
   )
 }
 
+/** "v1.2.0 available" beside the feed dots once the startup check has answered.
+ *  The scanner asks GitHub once at startup (scanner/update_check.py); this only
+ *  reads the answer. Dismiss hides it for this release until the page reloads.
+ *  The first answer also puts the running version in the browser tab. */
+function UpdateBadge() {
+  const [v, setV] = useState<{ latest: string; url: string } | null>(null)
+  const [hidden, setHidden] = useState(false)
+  useEffect(() => {
+    let tries = 0
+    const t = setInterval(() => {
+      api.version().then(r => {
+        if (r.current) document.title = `Edge Scanner v${r.current}`
+        if (r.checked) { clearInterval(t); if (r.available && r.latest) setV({ latest: r.latest, url: r.url }) }
+        else if (++tries > 20) clearInterval(t)
+      }).catch(() => { if (++tries > 20) clearInterval(t) })
+    }, 3000)
+    return () => clearInterval(t)
+  }, [])
+  if (!v || hidden) return null
+  return (
+    <span className="row" style={{ gap: 6, fontSize: 11 }} title="A newer release is on GitHub. Update: git pull, then rebuild the dashboard.">
+      <a href={v.url} target="_blank" rel="noreferrer" style={{ color: 'var(--accent)', fontWeight: 600 }}>{v.latest} available</a>
+      <button className="btn sm icon" onClick={() => setHidden(true)} title="Hide until next start">✕</button>
+    </span>
+  )
+}
+
 function ScreenSelector() {
   const screens = useScreens(s => s.screens)
   const order = useScreens(s => s.order)
@@ -159,6 +186,7 @@ export function TopBar() {
       </span>
       <span className="flex-spacer" />
       <FeedDots />
+      <UpdateBadge />
       <span className="sep" />
       {clockInfo?.replay && <span className="chip static" style={{ color: 'var(--link-purple)', borderColor: 'var(--link-purple)' }} title="Replaying a past session">REPLAY {clockInfo.replay.date}</span>}
       {session && <span className={`chip static ${session === 'rth' ? 'up' : ''}`} title="Session">{session.toUpperCase()}</span>}

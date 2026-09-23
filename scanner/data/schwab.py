@@ -145,25 +145,86 @@ def _num(v) -> float | None:
     return f if f == f else None
 
 
+def _last_session_before(moment: datetime) -> date:
+    """The most recent weekday whose regular session had closed by `moment` (ET)."""
+    d = moment.date()
+    if moment.hour * 60 + moment.minute < 16 * 60:      # today's session not over yet
+        d = date.fromordinal(d.toordinal() - 1)
+    while d.weekday() >= 5:
+        d = date.fromordinal(d.toordinal() - 1)
+    return d
+
+
 def _fresh(path: Path, df: pd.DataFrame, end: date) -> bool:
     """True when a cached frame does not need re-downloading.
 
-    Schwab serves ONE symbol per history request at about 120 requests a minute,
-    so re-downloading a whole-market universe every morning costs hours. A file
-    is fresh when its data already reaches the last session on or before `end`
-    (a Monday premarket start is served by Friday's bars), or when it was
-    written today (covers symbols that simply did not trade that session).
+    Schwab serves ONE symbol per history request at about 120 a minute, so
+    re-downloading a whole-market universe costs two hours. The question is not
+    "does the data reach `end`" (a file written Monday morning holds Friday's
+    bars, and Tuesday asks for Monday: that rule re-downloaded everything every
+    morning) but "could Schwab give more than this file has?" It could not if
+    the file was written after the close of the last session on or before `end`,
+    plus a margin for late final bars.
     """
     if df is None or df.empty:
         return False
+    written = datetime.fromtimestamp(path.stat().st_mtime, tz=_ET)
     target = end
-    while target.weekday() >= 5:                       # roll a weekend back to Friday
+    while target.weekday() >= 5:
         target = date.fromordinal(target.toordinal() - 1)
+    # Written after that session's close (with an hour for the tape to settle)?
+    close = datetime(target.year, target.month, target.day, 17, 0, tzinfo=_ET)
+    if written >= close:
+        return True
+    # Or the data itself already reaches that session.
     last = pd.Timestamp(df.index.max())
     last_day = last.tz_convert(_ET).date() if last.tzinfo is not None else last.date()
-    if last_day >= target:
-        return True
-    return datetime.fromtimestamp(path.stat().st_mtime).date() >= date.today()
+    return last_day >= target
+
+
+class _Asked:
+    """Earliest start date already requested from Schwab, per symbol, per cache.
+
+    A symbol whose history is shorter than the window asked for (a recent
+    listing) can never "cover" the start, so without a record of the request it
+    was downloaded again on every start: about 1,800 extra requests on a
+    6,456-symbol universe, fifteen minutes at Schwab's 120 a minute. If the same
+    span or a longer one was already asked for, the cached frame IS everything
+    Schwab has. Kept in one small JSON file beside the parquet files.
+    """
+
+    def __init__(self, cache_dir: Path) -> None:
+        self._path = Path(cache_dir) / "_asked.json"
+        self._lock = threading.Lock()
+        self._dirty = False
+        try:
+            self._map: dict[str, str] = json.loads(self._path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self._map = {}
+
+    def covers(self, symbol: str, start: date) -> bool:
+        got = self._map.get(symbol)
+        return got is not None and got <= start.isoformat()
+
+    def note(self, symbol: str, start: date) -> None:
+        iso = start.isoformat()
+        with self._lock:
+            if self._map.get(symbol, "9999") > iso:
+                self._map[symbol] = iso
+                self._dirty = True
+
+    def save(self) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            try:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = self._path.with_suffix(".tmp")
+                tmp.write_text(json.dumps(self._map), encoding="utf-8")
+                os.replace(tmp, self._path)
+                self._dirty = False
+            except OSError as exc:
+                log.debug("could not save %s: %s", self._path, exc)
 
 
 class SchwabFeed(DataFeed):
@@ -177,6 +238,9 @@ class SchwabFeed(DataFeed):
     ) -> None:
         self._cache_dir = Path(cache_dir)
         self._intraday_cache_dir = Path(intraday_cache_dir)
+        self._asked_daily = _Asked(self._cache_dir)
+        self._asked_intraday = _Asked(self._intraday_cache_dir)
+        self._in_batch = False
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         self._intraday_cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -284,10 +348,13 @@ class SchwabFeed(DataFeed):
         p = self._cache_dir / f"{symbol}.parquet"
         if p.exists():
             cached = parquet.load(symbol, self._cache_dir)
-            if _covers(cached, start) and _fresh(p, cached, end):
+            if _fresh(p, cached, end) and (_covers(cached, start) or self._asked_daily.covers(symbol, start)):
                 return cached
         df = self._price_history(symbol, "Day", start, end)
         parquet.save(symbol, df, self._cache_dir)
+        self._asked_daily.note(symbol, start)
+        if not self._in_batch:
+            self._asked_daily.save()
         return df
 
     def get_historical_bars(self, symbol: str, timeframe: Timeframe,
@@ -295,10 +362,13 @@ class SchwabFeed(DataFeed):
         p = self._intraday_cache_dir / f"{symbol}.parquet"
         if p.exists():
             cached = parquet.load(symbol, self._intraday_cache_dir)
-            if _covers(cached, start) and _fresh(p, cached, end):
+            if _fresh(p, cached, end) and (_covers(cached, start) or self._asked_intraday.covers(symbol, start)):
                 return cached
         df = self._price_history(symbol, timeframe, start, end)
         parquet.save(symbol, df, self._intraday_cache_dir)
+        self._asked_intraday.note(symbol, start)
+        if not self._in_batch:
+            self._asked_intraday.save()
         return df
 
     def get_bars_range(self, symbol: str, timeframe: Timeframe,
@@ -348,6 +418,7 @@ class SchwabFeed(DataFeed):
         skipped so one bad symbol never stops a warmup."""
         out: dict[str, pd.DataFrame] = {}
         done = 0
+        self._in_batch = True             # one write of the request record, at the end
         with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
             futs = {pool.submit(fetch, s): s for s in symbols}
             for fut in as_completed(futs):
@@ -361,6 +432,9 @@ class SchwabFeed(DataFeed):
                 done += 1
                 if progress is not None:
                     progress(done, len(symbols))
+        self._in_batch = False
+        self._asked_daily.save()
+        self._asked_intraday.save()
         return out
 
     def get_historical_daily_multi(self, symbols: list[str], start: date, end: date,
@@ -373,6 +447,33 @@ class SchwabFeed(DataFeed):
                                   start: date, end: date, workers: int = 0,
                                   progress=None) -> dict[str, pd.DataFrame]:
         return self._multi(lambda s: self.get_historical_bars(s, timeframe, start, end), symbols, progress)
+
+    def get_session_quotes(self, symbols: list[str]) -> dict[str, dict]:
+        """The session so far, from quotes: open, high, low, last and total volume.
+
+        For a mid-session start. Bars for today can only be back-filled for the
+        most liquid symbols (one request each), which would leave every other
+        symbol starting the day at zero volume, so its relative volume reads far
+        too low until the close. Quotes come 500 to a request, so the whole
+        universe takes seconds. What this cannot give is the session VWAP (it is
+        approximated by the day's typical price) or the split between premarket
+        and regular volume (total volume includes both).
+        """
+        out: dict[str, dict] = {}
+        for i in range(0, len(symbols), self.QUOTES_PER_REQUEST):
+            batch = symbols[i : i + self.QUOTES_PER_REQUEST]
+            try:
+                resp = self._request(lambda b=batch: self._client.quotes(symbols=b, fields="quote"))
+                for sym, payload in (resp.json() or {}).items():
+                    q = (payload or {}).get("quote") or {}
+                    row = {"open": _num(q.get("openPrice")), "high": _num(q.get("highPrice")),
+                           "low": _num(q.get("lowPrice")), "last": _num(q.get("lastPrice")),
+                           "volume": _num(q.get("totalVolume"))}
+                    if all(v is not None and v > 0 for v in row.values()):
+                        out[sym] = row
+            except Exception as exc:
+                log.warning("Schwab session quotes failed for %d symbols: %s", len(batch), exc)
+        return out
 
     def get_snapshot(self, symbols: list[str]) -> dict[str, dict]:
         result: dict[str, dict] = {}
@@ -432,6 +533,9 @@ class SchwabFeed(DataFeed):
     LEVELONE_CAP = 3000           # live quotes
     QUOTES_PER_REQUEST = 500      # REST quotes
     POLL_SECONDS = 10.0           # one pass over the polled symbols
+    # No batch history endpoint: callers that would re-download bars for the whole
+    # universe (the premarket lists) must use the scanner's live state instead.
+    per_symbol_history = True
     SEED_MAX_SYMBOLS = 600        # today's-bars seeding at startup: about 5 minutes
 
     @staticmethod
@@ -457,10 +561,20 @@ class SchwabFeed(DataFeed):
                 return SchwabFeed.CHART_EQUITY_CAP if service == "CHART_EQUITY" else SchwabFeed.LEVELONE_CAP
         return None
 
+    # Schwab's minute bars carry about this share of the cumulative volume its
+    # quotes report, evenly through the day. Measured against a consolidated feed
+    # on 12 symbols across the tiers: 0.64 to 0.82, median 0.77. Built volume is
+    # scaled by it so that relative volume, which divides by a baseline made from
+    # those minute bars, compares like with like. A per-symbol factor from cached
+    # history was tried (regular-session 5-minute volume over daily volume) and was
+    # WORSE than this constant: daily volume includes the closing auction and
+    # after-hours trading, which the intraday total never sees.
+    BAR_VOLUME_SHARE = 0.77
+
     @staticmethod
     def handle_quotes(raw, builder) -> None:
         """Feed LEVELONE_EQUITIES updates to a QuoteBarBuilder. Fields: 3 last
-        price, 8 total volume, 10 day high, 11 day low. The streamer sends only
+        price, 8 total volume, 9 last size (shares), 10 day high, 11 day low. The streamer sends only
         the fields that changed, so any of them may be missing."""
         try:
             msg = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
@@ -472,7 +586,8 @@ class SchwabFeed(DataFeed):
             for c in block.get("content", []) or []:
                 try:
                     builder.on_quote(c.get("key"), last=_num(c.get("3")), total_volume=_num(c.get("8")),
-                                     day_high=_num(c.get("10")), day_low=_num(c.get("11")))
+                                     day_high=_num(c.get("10")), day_low=_num(c.get("11")),
+                                     last_size=_num(c.get("9")))
                 except Exception as exc:
                     log.debug("Skipping malformed LEVELONE payload: %s", exc)
 
@@ -524,6 +639,8 @@ class SchwabFeed(DataFeed):
             builder.track(sym, grace=3.0)
         for sym in self.polled_symbols:
             builder.track(sym, grace=self.POLL_SECONDS + 5.0)
+        for sym in self.quote_streamed_symbols + self.polled_symbols:
+            builder.set_scale(sym, self.BAR_VOLUME_SHARE)
 
         def _receiver(raw) -> None:
             chart_cap = self.parse_symbol_cap(raw, "CHART_EQUITY")
@@ -536,6 +653,7 @@ class SchwabFeed(DataFeed):
                     if synthetic:
                         for sym in over:
                             builder.track(sym, grace=self.POLL_SECONDS + 5.0)
+                            builder.set_scale(sym, self.BAR_VOLUME_SHARE)
                         self.polled_symbols = over + self.polled_symbols
                     else:
                         self.unstreamed_symbols = over + self.unstreamed_symbols
@@ -562,7 +680,7 @@ class SchwabFeed(DataFeed):
         for i in range(0, len(self.streamed_symbols), _CHUNK):
             stream.send(stream.chart_equity(self.streamed_symbols[i : i + _CHUNK], "0,1,2,3,4,5,6,7,8"))
         for i in range(0, len(self.quote_streamed_symbols), _CHUNK):
-            stream.send(stream.level_one_equities(self.quote_streamed_symbols[i : i + _CHUNK], "0,3,8,10,11"))
+            stream.send(stream.level_one_equities(self.quote_streamed_symbols[i : i + _CHUNK], "0,3,8,9,10,11"))
         log.info("Schwab: %d symbols on real bars, %d on streamed quotes, %d on polled quotes",
                  len(self.streamed_symbols), len(self.quote_streamed_symbols), len(self.polled_symbols))
         if synthetic and rest:
@@ -586,7 +704,8 @@ class SchwabFeed(DataFeed):
                         for sym, payload in (resp.json() or {}).items():
                             q = (payload or {}).get("quote") or {}
                             builder.on_quote(sym, last=_num(q.get("lastPrice")), total_volume=_num(q.get("totalVolume")),
-                                             day_high=_num(q.get("highPrice")), day_low=_num(q.get("lowPrice")))
+                                             day_high=_num(q.get("highPrice")), day_low=_num(q.get("lowPrice")),
+                                             last_size=_num(q.get("lastSize")))
                     except Exception as exc:
                         log.warning("Schwab quote poll failed for %d symbols: %s", len(batch), exc)
                 self._stop_evt.wait(max(0.5, self.POLL_SECONDS - (time.monotonic() - t0)))

@@ -21,6 +21,32 @@ Bars follow the same rules as real ones: stamped at the start of their minute in
 UTC, emitted once after the minute ends, and only for minutes that traded. A
 minute with no trade produces no bar.
 
+ODD LOTS. On the consolidated tape an odd-lot trade counts toward volume but may
+not set a bar's open, high, low or close, and real bars follow that rule. A
+quote's "last price" does not: it shows the most recent trade of any size, and
+in thin trading (premarket above all) most prints are odd lots at off-market
+prices. Measured on the first live morning, bars built from every last price had
+premarket highs and lows about 0.7% wider than real bars, up to 8%. So a price
+only counts when the quote's last size is a round lot for that price; an
+odd-lot print still adds its volume. A minute with volume but no round-lot
+price produces no bar, as on the tape.
+
+VOLUME. Two things measured on the first live session, both of which made the
+built bars' volume run far above a real bar's:
+
+  * The day's cumulative volume is sometimes revised DOWN by a small amount (a
+    cancelled or corrected trade). Treating any decrease as "the counter was
+    reset" added the whole day's volume again: over an afternoon some symbols
+    carried 2.5 times the volume the provider itself reported. Only a collapse
+    to a small fraction of the previous total is a reset; a small decrease is a
+    correction and adds nothing.
+  * A provider's own minute bars may count fewer prints than its cumulative
+    volume does. Schwab's carry 60 to 85 percent of it, evenly through the day
+    and steady per symbol (odd lots, most likely). Relative volume divides
+    today's volume by a baseline built from those bars, so an unscaled built bar
+    read 20 to 40 percent high. `set_scale` gives each symbol the factor that
+    puts its built volume on the same footing as the provider's real bars.
+
 Thread-safe: quotes may arrive from a stream thread and a polling thread while
 a timer thread flushes finished minutes.
 """
@@ -34,9 +60,29 @@ from typing import Callable, Optional
 import pandas as pd
 
 
+# A cumulative volume that falls below this fraction of its previous value is a
+# counter reset (a new session). Anything smaller is a correction.
+_RESET_FRACTION = 0.2
+
+
+def round_lot(price: float) -> int:
+    """Shares in a round lot at this price (SEC tiers in force since late 2025)."""
+    if price <= 250.0:
+        return 100
+    if price <= 1000.0:
+        return 40
+    if price <= 10000.0:
+        return 10
+    return 1
+
+
 @dataclass
 class _Sym:
-    last: Optional[float] = None          # last trade price seen
+    last: Optional[float] = None          # last ROUND-LOT trade price seen
+    raw_last: Optional[float] = None      # last trade price of any size
+    last_size: Optional[float] = None     # size of the most recent trade, in shares
+    priced: bool = False                  # a round-lot price arrived in the bar being built
+    pending: bool = False                 # a round-lot price arrived that no bar has used yet
     total: Optional[float] = None         # cumulative day volume seen
     day_high: Optional[float] = None
     day_low: Optional[float] = None
@@ -47,6 +93,7 @@ class _Sym:
     c: float = 0.0
     v: float = 0.0
     grace: float = 3.0                    # seconds after the minute ends before it may be emitted
+    scale: float = 1.0                    # built volume x scale = volume on the provider's bar footing
 
 
 class QuoteBarBuilder:
@@ -72,18 +119,36 @@ class QuoteBarBuilder:
         with self._lock:
             self._syms.setdefault(symbol, _Sym()).grace = grace
 
+    def set_scale(self, symbol: str, scale: float) -> None:
+        """Multiply this symbol's built volume by `scale` (see VOLUME above)."""
+        with self._lock:
+            s = self._syms.get(symbol)
+            if s is not None and scale == scale and scale > 0:
+                s.scale = float(scale)
+
     def on_quote(self, symbol: str, last: Optional[float] = None, total_volume: Optional[float] = None,
-                 day_high: Optional[float] = None, day_low: Optional[float] = None) -> None:
+                 day_high: Optional[float] = None, day_low: Optional[float] = None,
+                 last_size: Optional[float] = None) -> None:
         """One quote update. Any field may be missing (a stream sends only what
-        changed); the last known value is kept."""
+        changed); the last known value is kept. `last_size` is in shares; when a
+        provider never sends it, every price counts."""
         done: Optional[dict] = None
         with self._lock:
             s = self._syms.get(symbol)
             if s is None:
                 return
             self.quotes_seen += 1
+            if last_size is not None:
+                s.last_size = float(last_size)
             if last is not None and last > 0:
-                s.last = float(last)
+                s.raw_last = float(last)
+            # The price counts only when the trade that set it was a round lot.
+            eligible = s.raw_last is not None and (s.last_size is None or s.last_size >= round_lot(s.raw_last))
+            # A stream may send the price and the volume of one trade in separate
+            # updates, so a new round-lot price waits for the next volume change.
+            if eligible and (last is not None or last_size is not None):
+                s.pending = True
+                s.last = s.raw_last
             new_high = day_high is not None and s.day_high is not None and day_high > s.day_high
             new_low = day_low is not None and s.day_low is not None and 0 < day_low < s.day_low
             if day_high is not None and day_high > 0:
@@ -91,35 +156,45 @@ class QuoteBarBuilder:
             if day_low is not None and day_low > 0:
                 s.day_low = float(day_low)
 
-            if total_volume is None or s.last is None:
+            if total_volume is None:
                 return
             total = float(total_volume)
             if s.total is None:                       # first sight: a baseline, not a trade
                 s.total = total
+                s.pending = False
                 return
             if total == s.total:
                 return                                # bid/ask moved, nothing traded
-            # A smaller total means the provider reset its day counter: everything
-            # it now reports traded since the reset.
-            delta = total - s.total if total > s.total else total
+            if total > s.total:
+                delta = total - s.total
+            elif total < s.total * _RESET_FRACTION:
+                delta = total             # the day counter was reset: this traded since
+            else:
+                delta = 0.0               # a small downward revision: a correction, not new volume
             s.total = total
             if delta <= 0:
                 return
+            delta *= s.scale
 
             minute = int(self._clock() // 60)
             if s.minute is not None and minute != s.minute:
                 done = self._close(symbol, s)
             if s.minute is None:
-                s.minute, s.o, s.h, s.l, s.v = minute, s.last, s.last, s.last, 0.0
-            s.c = s.last
-            s.h = max(s.h, s.last)
-            s.l = min(s.l, s.last)
-            s.v += delta
+                s.minute, s.v, s.priced = minute, 0.0, False
+            s.v += delta                              # every print counts toward volume
+            if s.pending or (eligible and not s.priced):
+                s.pending = False
+                if not s.priced:
+                    s.o = s.h = s.l = s.last
+                    s.priced = True
+                s.c = s.last
+                s.h = max(s.h, s.last)
+                s.l = min(s.l, s.last)
             # The day's extreme moved since the previous quote, so it was printed
             # inside this bar: take it exactly, even if no quote caught it.
-            if new_high and s.day_high is not None and s.day_high >= s.h:
+            if s.priced and new_high and s.day_high is not None and s.day_high >= s.h:
                 s.h = s.day_high
-            if new_low and s.day_low is not None and s.day_low <= s.l:
+            if s.priced and new_low and s.day_low is not None and s.day_low <= s.l:
                 s.l = s.day_low
         if done is not None:
             self._send(done)
@@ -132,12 +207,17 @@ class QuoteBarBuilder:
         with self._lock:
             for symbol, s in self._syms.items():
                 if s.minute is not None and now >= (s.minute + 1) * 60 + s.grace:
-                    out.append(self._close(symbol, s))
+                    bar = self._close(symbol, s)
+                    if bar is not None:
+                        out.append(bar)
         for bar in out:
             self._send(bar)
         return len(out)
 
-    def _close(self, symbol: str, s: _Sym) -> dict:
+    def _close(self, symbol: str, s: _Sym) -> Optional[dict]:
+        if not s.priced:                  # volume but no round-lot price: no bar, as on the tape
+            s.minute = None
+            return None
         bar = {
             "symbol": symbol,
             "timestamp": pd.Timestamp(s.minute * 60, unit="s", tz="UTC"),

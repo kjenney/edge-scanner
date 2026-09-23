@@ -229,3 +229,38 @@ def test_quote_stream_cap_moves_the_overflow_to_polling(monkeypatch):
         "code": 19, "msg": "You've reached the maximum number of symbols allowed.  (LEVELONE_EQUITIES=2000, DISCARDED=250)"}}]})
     assert feed.quote_streamed_symbols == symbols[300:2300]
     assert feed.polled_symbols == symbols[2300:]          # overflow first, then the original tail
+
+
+def test_short_history_is_not_downloaded_again_once_that_span_was_asked_for(tmp_path):
+    """A recent listing can never reach back to the start asked for. Once that
+    span has been requested, what is cached is everything the provider has."""
+    c = _Client()
+    f = _feed(tmp_path, c)
+    far_back = date(2020, 1, 1)                     # long before the fake client's first candle
+    f.get_historical_daily("AAA", far_back, date(2026, 1, 20))
+    f.get_historical_daily("AAA", far_back, date(2026, 1, 20))
+    assert c.calls == ["AAA"]                       # second call reused the cache
+    f.get_historical_daily("AAA", date(2019, 1, 1), date(2026, 1, 20))     # longer still: ask again
+    assert c.calls == ["AAA", "AAA"]
+    assert _feed(tmp_path, c).get_historical_daily("AAA", far_back, date(2026, 1, 20)) is not None
+    assert c.calls == ["AAA", "AAA"]                # the record survives a restart
+
+
+def test_cache_written_after_the_last_close_is_fresh_the_next_morning(tmp_path):
+    """Monday morning's file holds Friday's bars. Tuesday asks for Monday: the file
+    was written before Monday's close, so it is stale. Tuesday evening's file,
+    written after Monday's close, is fresh on Wednesday morning."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from scanner.data.schwab import _fresh
+    et = ZoneInfo("America/New_York")
+    idx = pd.date_range("2026-09-14", "2026-09-18", freq="B", tz="UTC")
+    df = pd.DataFrame({"volume": 1.0}, index=idx)               # data through Fri 09-18
+    p = tmp_path / "x.parquet"; p.write_bytes(b"x")
+    import os
+    os.utime(p, (datetime(2026, 9, 21, 9, 43, tzinfo=et).timestamp(),) * 2)      # written Mon 09:43
+    assert _fresh(p, df, date(2026, 9, 18))                      # asked for Friday: fine
+    assert not _fresh(p, df, date(2026, 9, 21))                  # asked for Monday: stale
+    os.utime(p, (datetime(2026, 9, 21, 17, 30, tzinfo=et).timestamp(),) * 2)     # rewritten Mon 17:30
+    assert _fresh(p, df, date(2026, 9, 21))                      # Tuesday morning: nothing more to get
+    assert _fresh(p, df, date(2026, 9, 20))                      # a Sunday rolls back to Friday

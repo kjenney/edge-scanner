@@ -318,6 +318,13 @@ def register_v2_routes(app: FastAPI, app_state, **state_kw) -> V2State:
         except Exception:
             return None
 
+    @app.get("/api/v2/version")
+    async def v2_version() -> JSONResponse:
+        """This scanner's version and, once the startup check has answered, the
+        latest public release (scanner/update_check.py). No request is made here."""
+        from scanner.update_check import info
+        return JSONResponse(info().as_dict())
+
     @app.get("/api/v2/clock")
     async def v2_clock() -> JSONResponse:
         now = datetime.now(_ET)

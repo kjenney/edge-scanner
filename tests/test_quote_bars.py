@@ -106,3 +106,68 @@ def test_untracked_symbols_are_ignored():
     b.on_quote("ZZZ", last=1.1, total_volume=5)
     clock.t += 120
     assert b.flush() == 0
+
+
+# ── odd lots: volume yes, price no (found on the first live morning) ──────────
+
+def test_odd_lot_prints_add_volume_but_never_set_the_price():
+    b, bars, clock = _builder()
+    b.on_quote("AAPL", last=100.00, total_volume=1_000, last_size=200)       # baseline, round lot
+    clock.t += 5;  b.on_quote("AAPL", last=100.10, total_volume=1_300, last_size=300)
+    clock.t += 5;  b.on_quote("AAPL", last=104.96, total_volume=1_303, last_size=3)      # off-market odd lot
+    clock.t += 5;  b.on_quote("AAPL", last=96.50, total_volume=1_304, last_size=1)       # another
+    clock.t += 5;  b.on_quote("AAPL", last=100.20, total_volume=1_504, last_size=200)
+    clock.t += 70; b.flush()
+    bar = bars[0]
+    assert (bar["open"], bar["high"], bar["low"], bar["close"]) == (100.10, 100.20, 100.10, 100.20)
+    assert bar["volume"] == 504                                               # odd lots still count
+
+
+def test_a_minute_of_only_odd_lots_makes_no_bar():
+    b, bars, clock = _builder()
+    b.on_quote("AAPL", last=50.0, total_volume=1_000, last_size=100)
+    clock.t += 60
+    b.on_quote("AAPL", last=50.7, total_volume=1_005, last_size=5)
+    clock.t += 70
+    assert b.flush() == 0 and bars == []
+
+
+def test_round_lot_is_smaller_for_expensive_stocks():
+    from scanner.data.quote_bars import round_lot
+    assert [round_lot(p) for p in (50, 250, 251, 1000, 1001, 10001)] == [100, 100, 40, 40, 10, 1]
+    b, bars, clock = _builder()
+    b.on_quote("AAPL", last=600.0, total_volume=1_000, last_size=100)
+    clock.t += 5; b.on_quote("AAPL", last=601.0, total_volume=1_040, last_size=40)       # 40 is a round lot at $601
+    clock.t += 70; b.flush()
+    assert bars[0]["close"] == 601.0
+
+
+def test_unknown_size_keeps_the_old_behaviour():
+    b, bars, clock = _builder()
+    b.on_quote("AAPL", last=10.0, total_volume=100)
+    clock.t += 5; b.on_quote("AAPL", last=10.2, total_volume=150)
+    clock.t += 70; b.flush()
+    assert bars[0]["close"] == 10.2
+
+
+# ── volume: corrections and the provider's bar footing (first live session) ───
+
+def test_a_small_downward_revision_adds_nothing():
+    """A corrected trade lowers the day's total a little. Treating that as a
+    counter reset re-added the whole day's volume (2.5x on some symbols)."""
+    b, bars, clock = _builder()
+    b.on_quote("AAPL", last=50.0, total_volume=1_000_000)
+    clock.t += 5; b.on_quote("AAPL", last=50.1, total_volume=1_000_400)
+    clock.t += 5; b.on_quote("AAPL", last=50.1, total_volume=1_000_300)      # revised down by 100
+    clock.t += 5; b.on_quote("AAPL", last=50.2, total_volume=1_000_500)
+    clock.t += 70; b.flush()
+    assert bars[0]["volume"] == 600                                          # 400 + 200, not a million
+
+
+def test_scale_puts_built_volume_on_the_providers_bar_footing():
+    b, bars, clock = _builder()
+    b.set_scale("AAPL", 0.75)
+    b.on_quote("AAPL", last=50.0, total_volume=1_000)
+    clock.t += 5; b.on_quote("AAPL", last=50.1, total_volume=1_400)
+    clock.t += 70; b.flush()
+    assert bars[0]["volume"] == 300

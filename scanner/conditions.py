@@ -272,10 +272,17 @@ _add(ConditionDef(
     min=0, step=1_000_000, availability="pass",
 ))
 
+def _short_pct(c: ConditionCtx, o: str, p: dict) -> Optional[float]:
+    # The cache holds a fraction (0.139 for 13.9%), as Yahoo reports it; the
+    # threshold is typed in percent. Compared raw, "at least 10" could never pass.
+    v = _f((c.fundamentals or {}).get("short_pct_float"))
+    return v * 100.0 if v is not None else None
+
+
 _add(ConditionDef(
     "short_pct_float", "Short % of float", "Fundamentals",
     "Short interest as a percent of float. Missing values PASS.",
-    "static", _fund("short_pct_float"),
+    "static", _short_pct,
     unit="%", ops=("gte", "lte"), default_op="gte", default_value=10.0,
     min=0, max=100, step=0.5, availability="pass",
 ))

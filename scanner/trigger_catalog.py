@@ -305,7 +305,7 @@ def _build_catalog() -> list[TriggerDef]:
                            ParamDef("max_dwell", "Candles allowed near VWAP", 1, 0, 10, 1, "candles")), default_options=("support",)))
     add(TriggerDef("range_break", "Range break", "Highs & lows",
                    "Price has been trapped inside a tight range for N completed candles and "
-                   "then leaves it on a volume bar. The same shape as an opening-range break, "
+                   "then leaves it on a 1-minute bar with several times the range's average minute volume. The same shape as an opening-range break, "
                    "except the range is any N-candle consolidation rather than the first "
                    "candle of the day, so it can happen at any hour.",
                    "both", _UPDOWN, "Direction",
@@ -318,7 +318,13 @@ def _build_catalog() -> list[TriggerDef]:
                                       "scales it to how much the stock normally moves in a day. "
                                       "x avg candle compares it with the stock's own recent candles, "
                                       "so it adjusts to a busy open and a quiet lunch."),
-                           ParamDef("vol_mult", "Breakout volume", 1.5, 1, 10, 0.1, "x avg"),
+                           # vol_min replaced vol_mult, which compared the 1-minute
+                           # breaking bar with a whole range candle; a saved vol_mult
+                           # is converted on load (custom_setups.migrate_trigger).
+                           ParamDef("vol_min", "Breakout volume", 6.0, 1, 30, 0.5, "x avg minute",
+                                    "Volume of the 1-minute bar that leaves the range, against the "
+                                    "range's average minute. 6x on a 5-minute range is the same bar "
+                                    "as a 1.2x 5-minute candle."),
                            ParamDef("tf", "Timeframe", 5, 1, 60, 1, "min")), default_options=("up",)))
     add(TriggerDef("ema_cross_ema", "EMA crosses EMA", "Crosses & levels",
                    "A faster EMA crosses a slower one on the chosen timeframe. Every other "
@@ -780,6 +786,14 @@ class EvalCtx:
     external: set[str]             # "setup:<code>"
     spy_mom_15m: Optional[float] = None
     resolved_levels: dict = field(default_factory=dict)
+    # Namespace for this trigger configuration's latches in series.mem. Two setups
+    # using one trigger with different settings (RVOL 1.5x and 3x, swing lookback
+    # 3 and 5) reach their transitions on different bars, and a shared latch let
+    # the first one silence the other. The evaluator sets it per configuration.
+    scope: str = ""
+    # Priming: latches record where the market is, but nothing fires. Used once at
+    # startup so a start after the open does not announce the morning's events.
+    priming: bool = False
 
     @property
     def close(self) -> float:
@@ -799,18 +813,27 @@ class EvalCtx:
     def _level(self, key: str) -> Optional[float]:
         return level_value(self.series, self.state, key)
 
+    def _mem_key(self, key: str) -> str:
+        return f"{self.scope}|{key}" if self.scope else key
+
     def once(self, key: str) -> bool:
-        """True the first time `key` is seen today (per symbol)."""
-        if self.series.mem.get(key):
+        """True the first time `key` is seen today (per symbol and configuration)."""
+        k = self._mem_key(key)
+        if self.series.mem.get(k):
             return False
-        self.series.mem[key] = True
-        return True
+        self.series.mem[k] = True
+        return not self.priming
 
     def edge(self, key: str, cond: bool) -> bool:
         """True when `cond` turns True (was False or unknown before)."""
-        was = self.series.mem.get(key, False)
-        self.series.mem[key] = cond
-        return cond and not was
+        k = self._mem_key(key)
+        was = self.series.mem.get(k, False)
+        self.series.mem[k] = cond
+        return cond and not was and not self.priming
+
+    def rearm(self, key: str) -> None:
+        """Clear a latch so the next transition fires again."""
+        self.series.mem[self._mem_key(key)] = False
 
 
 def _f(v) -> Optional[float]:
@@ -879,7 +902,9 @@ def _t_near_hod(c: EvalCtx, opt: str, p: dict) -> Optional[Fire]:
         if lvl is None:
             return None
         dist = lvl - c.close
-        near = 0 < dist < atr
+        # The bar's high must stay at or under the level: a bar that wicked
+        # through and closed just under it broke the high, it did not near it.
+        near = 0 < dist < atr and float(c.bar["high"]) <= lvl
         if c.edge(f"near_hod:{opt}", near):
             return Fire("long", dist, f"{dist:.2f} below HOD {lvl:.2f}")
     else:
@@ -887,7 +912,7 @@ def _t_near_hod(c: EvalCtx, opt: str, p: dict) -> Optional[Fire]:
         if lvl is None:
             return None
         dist = c.close - lvl
-        near = 0 < dist < atr
+        near = 0 < dist < atr and float(c.bar["low"]) >= lvl
         if c.edge(f"near_hod:{opt}", near):
             return Fire("short", dist, f"{dist:.2f} above LOD {lvl:.2f}")
     return None
@@ -1007,7 +1032,8 @@ def _near_last(c: EvalCtx, tf: int, lookback: int, side: str) -> Optional[Fire]:
     if lvl is None or atr is None or atr <= 0:
         return None
     dist = (lvl - c.close) if side == "high" else (c.close - lvl)
-    near = 0 < dist < atr
+    inside = float(c.bar["high"]) <= lvl if side == "high" else float(c.bar["low"]) >= lvl
+    near = 0 < dist < atr and inside
     if c.edge(f"near:{side}:{tf}", near):
         return Fire("long" if side == "high" else "short", dist, f"{dist:.2f} from {TF_LABEL[tf]} {side} {lvl:.2f}")
     return None
@@ -1257,7 +1283,9 @@ def _t_vspike(c: EvalCtx, opt: str, p: dict) -> Optional[Fire]:
 @_impl("consec_candles")
 def _t_consec(c: EvalCtx, opt: str, p: dict) -> Optional[Fire]:
     tf = int(p.get("tf", 5))
-    if tf not in TIMEFRAMES or not c.series.completed[tf]:
+    # Priming reads the streak on any bar: the startup bar rarely completes a
+    # candle, and an unprimed streak read as new on the next candle close.
+    if tf not in TIMEFRAMES or not (c.series.completed[tf] or c.priming):
         return None
     need = int(p["count"])
     if len(c.series.candles[tf]) < need:
@@ -1271,7 +1299,7 @@ def _t_consec(c: EvalCtx, opt: str, p: dict) -> Optional[Fire]:
     if ok and c.edge(f"consec:{opt}:{tf}", ok):
         return Fire("long" if green else "short", float(need), f"{need} {opt} {TF_LABEL[tf]} candles")
     if not ok:
-        c.series.mem[f"consec:{opt}:{tf}"] = False
+        c.rearm(f"consec:{opt}:{tf}")
     return None
 
 
@@ -1530,9 +1558,11 @@ def _t_range_break(c: EvalCtx, opt: str, p: dict) -> Optional[Fire]:
     # Volume on the breaking bar, against the average INSIDE the range. A
     # consolidation is quiet by construction, so this asks whether anything
     # actually showed up to break it rather than whether it drifted out.
+    # Per minute on both sides: the breaking bar is one minute and the range
+    # candles are tf minutes (found by neusse, edge-scanner #18).
     vols = [float(x.get("volume") or 0.0) for x in cs]
-    avg = sum(vols) / len(vols) if vols else 0.0
-    if avg > 0 and float(c.bar.get("volume") or 0.0) < avg * float(p["vol_mult"]):
+    avg = sum(vols) / (len(vols) * tf) if vols else 0.0
+    if avg > 0 and float(c.bar.get("volume") or 0.0) < avg * float(p["vol_min"]):
         return None
     px = float(c.bar["close"])
     # edge(), not once(): the window slides forward with price, so a trend would
@@ -1542,7 +1572,7 @@ def _t_range_break(c: EvalCtx, opt: str, p: dict) -> Optional[Fire]:
     # two setups on the same candles with different widths or volume reach this
     # line on different bars, and a shared latch let the first one silence the
     # other.
-    key = f"rb:{tf}:{n}:{unit}:{float(p['max_range_pct'])}:{float(p['vol_mult'])}"
+    key = f"rb:{tf}:{n}:{unit}:{float(p['max_range_pct'])}:{float(p['vol_min'])}"
     if opt == "up":
         if c.edge(key + ":up", px > hi):
             return Fire("long", hi, f"broke {n}x{tf}min range high {hi:.2f} on volume")
@@ -1631,6 +1661,11 @@ def _t_gap(c: EvalCtx, opt: str, p: dict) -> Optional[Fire]:
     ref = c.level("prior_close")
     op = c.series.session_open()
     if not ref or op is None:
+        return None
+    # Only when this process saw the open. A symbol caught up mid-session from
+    # quotes has no opening bar, and its first live bar's open is not the gap.
+    first = next((b for b in c.series.m1 if b["session"] == "rth"), None)
+    if first is None or first["et_min"] > _RTH_OPEN + 5:
         return None
     gap = (op / ref - 1) * 100.0
     thr = float(p["min_pct"])

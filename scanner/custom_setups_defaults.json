@@ -103,7 +103,7 @@
             "bars": 5.0,
             "max_range_pct": 0.4,
             "width_unit": 1.0,
-            "vol_mult": 1.2,
+            "vol_min": 6.0,
             "tf": 5.0
           },
           "repeat_sec": 0

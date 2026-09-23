@@ -45,6 +45,9 @@ no login because nothing is exposed to the network.
 - **Goes out, unauthenticated:** company fundamentals from Yahoo Finance, and per-symbol news
   headlines from Yahoo Finance and Nasdaq RSS. Those services see the symbol being requested and
   your IP. Turn the news ones off with `NEWS_RSS_SOURCES=` in `.env`.
+- **Goes out, once at startup:** one anonymous request to GitHub's public releases page, to tell you
+  in the dashboard when a newer release exists. GitHub sees your IP and nothing else. Nothing is
+  downloaded or installed; the update is `git pull`. Turn it off with `UPDATE_CHECK=0` in `.env`.
 - **Never collected:** no analytics, no crash reports, no usage data. The project has no server.
 
 ## What's inside
@@ -166,6 +169,9 @@ npm --prefix dashboard-v2 run build
 
 Your `.env` and everything in `data/` (setups, universe filters, screens, watchlists, caches,
 alert archives) are left alone. Release notes call out anything that needs a one-time step.
+
+The dashboard shows a small "vX.Y.Z available" link next to the feed status when a newer release
+exists. To be told by GitHub instead, use **Watch, then Custom, then Releases** on the repo page.
 
 ## Configuration
 

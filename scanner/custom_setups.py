@@ -67,6 +67,32 @@ class SetupError(ValueError):
     pass
 
 
+def migrate_trigger(t: dict) -> dict:
+    """A trigger saved under an older parameter meaning, rewritten to the current one.
+
+    Range break: vol_mult compared the 1-minute breaking bar with a whole range
+    candle, so 1.2x on 5-minute candles asked for 6x a normal minute. vol_min
+    compares minute with minute; converting by the candle size keeps every saved
+    setup on exactly the alerts it had.
+    """
+    q = t.get("params") or {}
+    if t.get("id") == "range_break" and "vol_mult" in q and "vol_min" not in q:
+        q = dict(q)
+        try:
+            v = float(q.pop("vol_mult")) * float(q.get("tf", 5) or 5)
+            q["vol_min"] = round(min(30.0, max(1.0, v)), 2)
+        except (TypeError, ValueError):
+            pass
+        return dict(t, params=q)
+    return t
+
+
+def migrate_setup(s: dict) -> dict:
+    if not isinstance(s, dict) or not s.get("triggers"):
+        return s
+    return dict(s, triggers=[migrate_trigger(t) if isinstance(t, dict) else t for t in s["triggers"]])
+
+
 def normalize_setup(raw: dict, *, existing_id: Optional[str] = None) -> dict:
     """Validate + normalise a custom setup definition. Raises SetupError."""
     try:
@@ -115,6 +141,7 @@ def _normalize_setup(raw: dict, *, existing_id: Optional[str] = None) -> dict:
         else:
             opts = []
         params: dict[str, float] = {}
+        t = migrate_trigger(t)
         raw_params = t.get("params") or {}
         if tid in ("vwap_support", "vwap_resistance") and "tol_pct" in raw_params and "tol_unit" not in raw_params:
             # saved before tol_unit existed, when the tolerance was always % of
@@ -267,7 +294,7 @@ class CustomSetupStore:
             for p in sorted(self._dir.glob("*.json")):
                 d = _read_json(p)
                 if isinstance(d, dict) and d.get("id"):
-                    out.append(d)
+                    out.append(migrate_setup(d))
         out.sort(key=lambda s: (s.get("createdAt") or "", s.get("name") or ""))
         return out
 
@@ -276,7 +303,7 @@ class CustomSetupStore:
         if not sid2:
             return None
         d = _read_json(self._dir / f"{sid2}.json")
-        return d if isinstance(d, dict) else None
+        return migrate_setup(d) if isinstance(d, dict) else None
 
     def save(self, raw: dict, *, sid: Optional[str] = None) -> dict:
         s = normalize_setup(raw, existing_id=sid)
@@ -491,10 +518,15 @@ class CustomEvaluator:
         for (tid, opt), users in plan.keys.items():
             # every user of this key shares params only when identical; evaluate per distinct params
             done: dict[str, Optional[Fire]] = {}
+            # Every session, including one a setup does not alert in. Latches
+            # have to follow the market through premarket: skipped there, an
+            # EMA cross made at 07:00 read as a new cross at the open (measured
+            # on 2026-09-22: 200 "EMA crossed above" alerts at 09:30 instead of 52).
             for _, tcfg in users:
                 pkey = json.dumps(tcfg.get("params") or {}, sort_keys=True)
                 if pkey in done:
                     continue
+                ctx.scope = _scope(tid, opt, pkey)
                 try:
                     f = evaluate(tid, ctx, opt, tcfg.get("params") or {})
                 except Exception as exc:
@@ -571,6 +603,55 @@ class CustomEvaluator:
             k0, t0, f0 = fired_here[0]
             out.append(self._build_alert(state, bar, et, s, k0, f0, [k for k, _, _ in fired_here], sess))
         return out
+
+    def prime(self, states: dict, *, spy_mom_15m: Optional[float] = None,
+              now_et: Optional[pd.Timestamp] = None) -> int:
+        """Set every trigger's latches from where each symbol is now, firing nothing.
+
+        Startup replays today's bars into the candle rings but not through the
+        triggers, so on a start after the open every latch was blank: a gap at
+        09:30, an RVOL already above 2x or a streak already running all read as
+        new on the first live bar and alerted hours late. One priming pass over
+        each symbol's latest bar records them as already seen. Returns the
+        number of symbols primed.
+        """
+        plan = self._plan
+        if not plan.keys:
+            return 0
+        now_et = now_et if now_et is not None else pd.Timestamp.now(tz="America/New_York")
+        day = now_et.strftime("%Y-%m-%d")
+        primed = 0
+        for sym, state in (states or {}).items():
+            series = self._series.get(sym)
+            if series is None or series.session_date != day:
+                continue                    # nothing seen today: nothing to catch up on
+            if series.m1:
+                last = series.m1[-1]
+                bar = {k: last[k] for k in ("open", "high", "low", "close", "volume")}
+                em, sess = last["et_min"], last["session"]
+            else:
+                px = _f(getattr(state, "_last_close", None))
+                if px is None:
+                    continue
+                bar = {"open": px, "high": px, "low": px, "close": px, "volume": 0.0}
+                em = now_et.hour * 60 + now_et.minute
+                sess = "pre" if em < 9 * 60 + 30 else "rth" if em < 16 * 60 else "post"
+            ctx = EvalCtx(state=state, series=series, bar=bar, et_min=em, session=sess,
+                          external=set(), spy_mom_15m=spy_mom_15m, priming=True)
+            for (tid, opt), users in plan.keys.items():
+                done: set[str] = set()
+                for _, tcfg in users:
+                    pkey = json.dumps(tcfg.get("params") or {}, sort_keys=True)
+                    if pkey in done:
+                        continue
+                    done.add(pkey)
+                    ctx.scope = _scope(tid, opt, pkey)
+                    try:
+                        evaluate(tid, ctx, opt, tcfg.get("params") or {})
+                    except Exception as exc:
+                        log.debug("priming %s:%s failed for %s: %s", tid, opt, sym, exc)
+            primed += 1
+        return primed
 
     # ── alert ──
     def _build_alert(self, state: Any, bar: dict, et: pd.Timestamp, s: dict, key: str, f: Fire,
@@ -703,6 +784,11 @@ class CustomEvaluator:
             "enabled": bool(setup.get("enabled", True)),
             "session_ok": True,
         }
+
+
+def _scope(tid: str, opt: str, pkey: str) -> str:
+    """The latch namespace for one trigger configuration (see EvalCtx.scope)."""
+    return f"{tid}:{opt}:{pkey}"
 
 
 def _f(v) -> Optional[float]:

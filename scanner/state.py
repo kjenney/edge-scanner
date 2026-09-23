@@ -240,6 +240,7 @@ class SymbolState:
         self._pm_high: Optional[float] = None       # premarket 04:00-09:29 high
         self._pm_low:  Optional[float] = None       # premarket low
         self._pm_vol:  float = 0.0                  # premarket volume (sum)
+        self._pm_last: Optional[float] = None       # close of the latest premarket bar
         self._session_open: Optional[float] = None  # first RTH 1-min bar OPEN
         self._last_1m: deque[dict] = deque(maxlen=_RR_1M_RING)   # RTH 1-min bars, for 5-bar stop + 15m momentum
 
@@ -271,6 +272,7 @@ class SymbolState:
             self._pm_high = high if self._pm_high is None else max(self._pm_high, high)
             self._pm_low  = low  if self._pm_low  is None else min(self._pm_low,  low)
             self._pm_vol += vol
+            self._pm_last = close
             return
         if et_min >= _RTH_CLOSE_MIN:
             # Postmarket. Session VWAP, volume, HOD/LOD and the 5-min deque are
@@ -479,6 +481,11 @@ class SymbolState:
     @property
     def pm_low(self) -> Optional[float]:
         return self._pm_low
+
+    @property
+    def pm_last(self) -> Optional[float]:
+        """Close of the latest premarket bar seen this session."""
+        return self._pm_last
 
     @property
     def pm_vol(self) -> float:

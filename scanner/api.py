@@ -113,6 +113,36 @@ def origin_is_local(origin: Optional[str], host: Optional[str] = None) -> bool:
     return bool(host) and origin.split("://", 1)[-1] == host
 
 
+def _premarket_result(app_state: "AppState", items: list[dict], pm_keep: dict, symbols_total: int) -> dict:
+    """Rank the premarket items into the three lists, cache and return the payload."""
+    import datetime as _dt
+    from zoneinfo import ZoneInfo
+    et = ZoneInfo("America/New_York")
+
+    def _scoped(name: str) -> list[dict]:
+        k = pm_keep.get(name)
+        return items if k is None else [x for x in items if k(x["symbol"])]
+
+    gainers = sorted([x for x in _scoped("pm_gainers") if x["change_pct"] > 0],
+                     key=lambda x: x["change_pct"], reverse=True)[:25]
+    losers  = sorted([x for x in _scoped("pm_losers") if x["change_pct"] < 0],
+                     key=lambda x: x["change_pct"])[:25]
+    volume  = sorted(_scoped("pm_volume"),
+                     key=lambda x: x["premarket_volume"], reverse=True)[:25]
+    now_et = _dt.datetime.now(et)
+    result = {
+        "gainers":        gainers,
+        "losers":         losers,
+        "volume":         volume,
+        "symbols_total":  symbols_total,
+        "symbols_active": len(items),
+        "fetched_at":     now_et.strftime("%H:%M:%S ET"),
+        "session_date":   now_et.strftime("%Y-%m-%d"),
+    }
+    app_state._premarket_cache = (time.monotonic(), result)
+    return result
+
+
 def create_app(app_state: AppState) -> FastAPI:
     """Build and return the FastAPI application."""
     app = FastAPI(title="Scanner Dashboard API")
@@ -261,6 +291,28 @@ def create_app(app_state: AppState) -> FastAPI:
             for sym, st in states.items()
         }
 
+        # A provider with no batch history endpoint (Schwab: one request per
+        # symbol, about 120 a minute) cannot re-download today's bars for the
+        # whole universe on every refresh: the screen stays blank for minutes and
+        # the requests starve its live quote polling. The scanner already holds
+        # the premarket price and volume of every symbol from the bars it has
+        # processed, so such a provider is served from that, with no requests.
+        if getattr(app_state.feed, "per_symbol_history", False):
+            items = []
+            for sym in symbols:
+                st = states.get(sym)
+                last, vol, prev = getattr(st, "pm_last", None), getattr(st, "pm_vol", 0.0), prior_closes.get(sym)
+                if st is None or last is None or not vol:
+                    continue
+                items.append({
+                    "symbol":           sym,
+                    "price":            round(float(last), 2),
+                    "change_pct":       round((last - prev) / prev * 100, 2) if prev and prev > 0 else 0.0,
+                    "premarket_volume": int(vol),
+                    "prev_close":       round(float(prev), 2) if prev else None,
+                })
+            return JSONResponse(_premarket_result(app_state, items, pm_keep, len(symbols)))
+
         try:
             bars_map = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: app_state.feed.get_todays_bars_multi(symbols, "5Min")
@@ -301,29 +353,7 @@ def create_app(app_state: AppState) -> FastAPI:
             except Exception:
                 continue
 
-        def _scoped(name: str) -> list[dict]:
-            k = pm_keep.get(name)
-            return items if k is None else [x for x in items if k(x["symbol"])]
-
-        gainers = sorted([x for x in _scoped("pm_gainers") if x["change_pct"] > 0],
-                         key=lambda x: x["change_pct"], reverse=True)[:25]
-        losers  = sorted([x for x in _scoped("pm_losers") if x["change_pct"] < 0],
-                         key=lambda x: x["change_pct"])[:25]
-        volume  = sorted(_scoped("pm_volume"),
-                         key=lambda x: x["premarket_volume"], reverse=True)[:25]
-
-        now_et = _dt.datetime.now(_ET)
-        result = {
-            "gainers":        gainers,
-            "losers":         losers,
-            "volume":         volume,
-            "symbols_total":  len(symbols),
-            "symbols_active": len(items),
-            "fetched_at":     now_et.strftime("%H:%M:%S ET"),
-            "session_date":   now_et.strftime("%Y-%m-%d"),
-        }
-        app_state._premarket_cache = (time.monotonic(), result)
-        return JSONResponse(result)
+        return JSONResponse(_premarket_result(app_state, items, pm_keep, len(symbols)))
 
     # Routes contributed by an optional engine plugin (scanner/plugins.py).
     from scanner import plugins

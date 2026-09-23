@@ -1,0 +1,32 @@
+# Edge Scanner — one process: scanner engine + API (:7777) + dashboard.
+#
+#   1. Copy .env.example to .env and fill in your Alpaca (or Schwab) keys.
+#   2. docker compose up -d --build
+#   3. Open http://localhost:7777/v2
+#
+# The API has NO authentication. Keep the port mapping bound to localhost as
+# below (127.0.0.1:...) unless you are on a fully trusted network.
+
+services:
+  edge-scanner:
+    build: .
+    image: edge-scanner:latest
+    container_name: edge-scanner
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      # host 127.0.0.1 only — do not expose the unauthenticated API wider.
+      - "127.0.0.1:7777:7777"
+    volumes:
+      # Everything the scanner writes: caches, setups, watchlists, screens,
+      # alert archives, universe files. Survives rebuilds and upgrades.
+      - edgescanner-data:/app/data
+    environment:
+      TZ: America/New_York
+    # Extra args go straight to scripts/run_live.py (ENTRYPOINT pattern).
+    # Examples: --log-level INFO, --refresh-universe
+    # command: ["--log-level", "INFO"]
+
+volumes:
+  edgescanner-data:
